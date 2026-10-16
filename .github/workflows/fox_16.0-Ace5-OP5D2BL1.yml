@@ -232,15 +232,17 @@ jobs:
 
           cd "$WORK"
           rm -rf "$WORK/sync"
+          # NB: no --retry here - that is a curl flag, not a git one. The loop
+          # below is what retries.
           for attempt in 1 2 3 4 5; do
-            if git clone --depth=1 "${RETRY[@]}" \
-                 https://gitlab.com/OrangeFox/sync.git "$WORK/sync"; then
+            if git clone --depth=1 https://gitlab.com/OrangeFox/sync.git "$WORK/sync"; then
               break
             fi
             echo "cloning the sync script failed (attempt ${attempt}/5)"
             rm -rf "$WORK/sync"
             sleep $((attempt * 15))
           done
+          [ -d "$WORK/sync/.git" ] || { echo "::error::could not clone the OrangeFox sync script"; exit 1; }
 
           cd "$WORK/sync"
           sync_ok=0
@@ -273,7 +275,7 @@ jobs:
           git init -q .
           git remote add origin "$DEVICE_TREE"
           for attempt in 1 2 3 4 5; do
-            if git fetch --depth=1 "${RETRY[@]}" origin "$DEVICE_TREE_BRANCH" \
+            if git fetch --depth=1 origin "$DEVICE_TREE_BRANCH" \
                && git checkout -q FETCH_HEAD; then
               break
             fi
@@ -446,39 +448,46 @@ jobs:
             fi
           fi
 
-          # A run number suffix keeps repeated builds of one commit from
-          # clashing; the tag itself stays reproducible.
-          URL="https://github.com/${GITHUB_REPOSITORY}"
-          gh release create "$TAG" \
-            --repo "$GITHUB_REPOSITORY" \
-            --title "OrangeFox fox_$MANIFEST_BRANCH - OnePlus Ace 5 ($DEVICE_NAME) - run #$GITHUB_RUN_NUMBER" \
-            --notes "$(printf '%s\n' \
-              "Automatic OrangeFox \`fox_$MANIFEST_BRANCH\` build for the **OnePlus Ace 5** (PKG110 / $DEVICE_NAME / giulia)." \
-              "" \
-              "* device tree: ${DEVICE_TREE_URL} @ \`${DEVICE_COMMIT}\`" \
-              "* lunch: \`$LUNCH_TARGET\`" \
-              "* targets: \`$BUILD_TARGET\`" \
-              "* build type: \`$FOX_BUILD_TYPE\`" \
-              "* workflow run: $URL/actions/runs/$GITHUB_RUN_ID" \
-              "" \
-              "\`recovery.img\` is ramdisk-only (the kernel comes from the stock \`boot\`" \
-              "partition), so flash it with:" \
-              "" \
-              '```' \
-              "fastboot flash recovery_a recovery.img" \
-              "fastboot flash recovery_b recovery.img" \
-              '```' \
-              "" \
-              "Verify the attached \`recovery.img.sha256\` before flashing.")" \
-            $GITHUB_WORKSPACE/self/artifacts/recovery.img \
-            $GITHUB_WORKSPACE/self/artifacts/recovery.img.sha256 \
-            $GITHUB_WORKSPACE/self/artifacts/recovery.img.md5 \
-            $GITHUB_WORKSPACE/self/dist/OrangeFox*.img \
-            $GITHUB_WORKSPACE/self/dist/OrangeFox*.zip \
-            $GITHUB_WORKSPACE/self/dist/OrangeFox*.md5 \
-            $GITHUB_WORKSPACE/self/dist/recovery-installer.zip \
-            $GITHUB_WORKSPACE/self/dist/ramdisk-recovery.img \
-            --clobber || echo "::warning::could not create the release"
+          # Only hand over files that exist: a glob that matches nothing would
+          # be passed through as a literal path and fail the whole upload.
+          FILES=()
+          for f in "$GITHUB_WORKSPACE/self/artifacts/recovery.img" \
+                   "$GITHUB_WORKSPACE/self/artifacts/recovery.img.sha256" \
+                   "$GITHUB_WORKSPACE/self/artifacts/recovery.img.md5"; do
+            if [ -f "$f" ]; then FILES+=("$f"); fi
+          done
+          for f in "$GITHUB_WORKSPACE/self/dist/"*; do
+            if [ -f "$f" ]; then FILES+=("$f"); fi
+          done
+
+          TITLE="OrangeFox fox_$MANIFEST_BRANCH - OnePlus Ace 5 ($DEVICE_NAME) - run #$GITHUB_RUN_NUMBER"
+          NOTES="$(printf '%s\n' \
+            "Automatic OrangeFox \`fox_$MANIFEST_BRANCH\` build for the **OnePlus Ace 5** (PKG110 / $DEVICE_NAME / giulia)." \
+            "" \
+            "* device tree: ${DEVICE_TREE_URL} @ \`${DEVICE_COMMIT}\`" \
+            "* lunch: \`$LUNCH_TARGET\`" \
+            "* targets: \`$BUILD_TARGET\`" \
+            "* build type: \`$FOX_BUILD_TYPE\`" \
+            "* workflow run: https://github.com/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}" \
+            "" \
+            "\`recovery.img\` is ramdisk-only (the kernel comes from the stock \`boot\`" \
+            "partition), so flash it with:" \
+            "" \
+            '```' \
+            "fastboot flash recovery_a recovery.img" \
+            "fastboot flash recovery_b recovery.img" \
+            '```' \
+            "" \
+            "Verify the attached \`recovery.img.sha256\` before flashing.")"
+
+          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            # The same device tree commit built twice: replace the assets.
+            gh release upload "$TAG" --repo "$GITHUB_REPOSITORY" --clobber "${FILES[@]}"
+          else
+            gh release create "$TAG" --repo "$GITHUB_REPOSITORY" \
+              --title "$TITLE" --notes "$NOTES" "${FILES[@]}"
+          fi
+          gh release view "$TAG" --repo "$GITHUB_REPOSITORY" | head -15
 
       - name: Publish build report to the ci-logs branch
         # Runs whatever happened and force-pushes a report (image info, the
@@ -501,7 +510,7 @@ jobs:
             echo "- run: #$GITHUB_RUN_NUMBER (attempt $GITHUB_RUN_ATTEMPT) -> **$JOB_RESULT**"
             echo "- event: \`$GITHUB_EVENT_NAME\` on \`$GITHUB_REF\`"
             echo "- date: $(date -u +%Y-%m-%dT%H:%M:%SZ)"
-            echo "- device tree: \`${DEVICE_TREE_URL:-?}@${DEVICE_COMMIT:-?}\`"
+            echo "- device tree: \`${DEVICE_TREE_URL:-$DEVICE_TREE}@${DEVICE_COMMIT:-not-cloned}\`"
             echo "- lunch: \`$LUNCH_TARGET\` | targets: \`$BUILD_TARGET\` | type: \`$FOX_BUILD_TYPE\`"
             echo "- runner: $(nproc) vCPU, $(awk '/MemTotal/{printf "%d", $2/1024/1024}' /proc/meminfo) GiB RAM"
             echo
