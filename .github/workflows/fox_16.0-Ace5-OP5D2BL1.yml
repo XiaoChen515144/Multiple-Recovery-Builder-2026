@@ -359,7 +359,7 @@ jobs:
             : > "$GITHUB_WORKSPACE/self/ldcheck.log"
             for f in $LDCHECK; do
               echo "### ldcheck $f" | tee -a "$GITHUB_WORKSPACE/self/ldcheck.log"
-              ( cd "$LD_ROOT" && python3 ldcheck -p system/lib64:vendor/lib64:system/lib:vendor/lib \
+              ( cd "$LD_ROOT" && python3 ldcheck -p system/lib64:vendor/lib64:system/lib:vendor/lib:vendor/lib64/hw:vendor/lib/hw \
                   -d "$f" 2>&1 | tail -n 40 ) | tee -a "$GITHUB_WORKSPACE/self/ldcheck.log" || true
             done
           fi
@@ -384,7 +384,21 @@ jobs:
           cp -f "$PRODUCT_OUT"/OrangeFox*.img.md5 . 2>/dev/null || true
           cp -f "$PRODUCT_OUT"/OrangeFox*.zip.md5 . 2>/dev/null || true
           cp -f "$PRODUCT_OUT"/ramdisk-recovery.img . 2>/dev/null || true
-          cp -f "$GITHUB_WORKSPACE/self/artifacts/recovery.img."{sha256,md5} . 2>/dev/null || true
+          # NB: the checksums stay in artifacts/ only - a second copy here would
+          # be a second asset with the same name and the upload would fail.
+
+          # Optional recovery-installer.zip (third-party helper, off by default).
+          if [ "${{ github.event.inputs.RECOVERY_INSTALLER }}" = "true" ]; then
+            if curl -fsSL --retry 5 -o recovery-installer.zip \
+                 https://github.com/kinguser981/recovery-installer/releases/download/11256427880/recovery-installer.zip; then
+              cp -f "$GITHUB_WORKSPACE/self/artifacts/recovery.img" ./recovery.img
+              zip -ur recovery-installer.zip recovery.img >/dev/null || true
+              rm -f recovery.img
+            else
+              echo "::warning::could not fetch recovery-installer.zip"
+              rm -f recovery-installer.zip
+            fi
+          fi
           ls -l
 
           SIZE="$(stat -c %s recovery.img 2>/dev/null || stat -c %s "$IMAGE")"
@@ -422,7 +436,7 @@ jobs:
           if-no-files-found: ignore
           retention-days: 14
 
-      - name: Publish release
+      - name: Pick the release tag and drop a leftover draft
         if: >-
           success()
           && env.CHECK_IMG_IS_OK == 'true'
@@ -434,60 +448,59 @@ jobs:
           exec > >(tee -a "$GITHUB_WORKSPACE/self/ci.log") 2>&1
           TAG="fox16-${DEVICE_COMMIT:0:12}"
           [ -n "${DEVICE_COMMIT:-}" ] || TAG="fox16-run$GITHUB_RUN_NUMBER"
-          echo "publishing release $TAG"
+          echo "TAG=$TAG" >> "$GITHUB_ENV"
+          echo "release tag: $TAG"
 
-          # Optional recovery-installer.zip (third-party helper, off by default).
-          if [ "${{ github.event.inputs.RECOVERY_INSTALLER }}" = "true" ]; then
-            cd "$GITHUB_WORKSPACE/self/dist"
-            curl -fsSL --retry 5 -o recovery-installer.zip \
-              https://github.com/kinguser981/recovery-installer/releases/download/11256427880/recovery-installer.zip \
-              || echo "::warning::could not fetch recovery-installer.zip"
-            if [ -f recovery-installer.zip ]; then
-              cp -f "$GITHUB_WORKSPACE/self/artifacts/recovery.img" ./recovery.img
-              zip -ur recovery-installer.zip recovery.img || true
-            fi
-          fi
-
-          # Only hand over files that exist: a glob that matches nothing would
-          # be passed through as a literal path and fail the whole upload.
-          FILES=()
-          for f in "$GITHUB_WORKSPACE/self/artifacts/recovery.img" \
-                   "$GITHUB_WORKSPACE/self/artifacts/recovery.img.sha256" \
-                   "$GITHUB_WORKSPACE/self/artifacts/recovery.img.md5"; do
-            if [ -f "$f" ]; then FILES+=("$f"); fi
-          done
-          for f in "$GITHUB_WORKSPACE/self/dist/"*; do
-            if [ -f "$f" ]; then FILES+=("$f"); fi
+          # `gh release create` (and any asset failure in general) can leave a
+          # *draft* release behind. Drafts are invisible to releases/tags/<tag>
+          # and make the next attempt fail with "already_exists", so clear them.
+          ids="$(gh api "repos/$GITHUB_REPOSITORY/releases?per_page=100" \
+                   --jq '.[] | select(.draft==true and .tag_name=="'"$TAG"'") | .id' || true)"
+          for id in $ids; do
+            echo "deleting draft release $id (tag $TAG)"
+            gh api -X DELETE "repos/$GITHUB_REPOSITORY/releases/$id" || true
           done
 
-          TITLE="OrangeFox fox_$MANIFEST_BRANCH - OnePlus Ace 5 ($DEVICE_NAME) - run #$GITHUB_RUN_NUMBER"
-          NOTES="$(printf '%s\n' \
-            "Automatic OrangeFox \`fox_$MANIFEST_BRANCH\` build for the **OnePlus Ace 5** (PKG110 / $DEVICE_NAME / giulia)." \
-            "" \
-            "* device tree: ${DEVICE_TREE_URL} @ \`${DEVICE_COMMIT}\`" \
-            "* lunch: \`$LUNCH_TARGET\`" \
-            "* targets: \`$BUILD_TARGET\`" \
-            "* build type: \`$FOX_BUILD_TYPE\`" \
-            "* workflow run: https://github.com/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}" \
-            "" \
-            "\`recovery.img\` is ramdisk-only (the kernel comes from the stock \`boot\`" \
-            "partition), so flash it with:" \
-            "" \
-            '```' \
-            "fastboot flash recovery_a recovery.img" \
-            "fastboot flash recovery_b recovery.img" \
-            '```' \
-            "" \
-            "Verify the attached \`recovery.img.sha256\` before flashing.")"
+      - name: Publish release
+        if: >-
+          success()
+          && env.CHECK_IMG_IS_OK == 'true'
+          && github.event.inputs.PUBLISH_RELEASE != 'false'
+        uses: softprops/action-gh-release@v3
+        with:
+          tag_name: ${{ env.TAG }}
+          name: OrangeFox fox_${{ env.MANIFEST_BRANCH }} - OnePlus Ace 5 (${{ env.DEVICE_NAME }}) - run #${{ github.run_number }}
+          body: |
+            Automatic OrangeFox `fox_${{ env.MANIFEST_BRANCH }}` build for the **OnePlus Ace 5**
+            (PKG110 / ${{ env.DEVICE_NAME }} / giulia).
 
-          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
-            # The same device tree commit built twice: replace the assets.
-            gh release upload "$TAG" --repo "$GITHUB_REPOSITORY" --clobber "${FILES[@]}"
-          else
-            gh release create "$TAG" --repo "$GITHUB_REPOSITORY" \
-              --title "$TITLE" --notes "$NOTES" "${FILES[@]}"
-          fi
-          gh release view "$TAG" --repo "$GITHUB_REPOSITORY" | head -15
+            * device tree: ${{ env.DEVICE_TREE_URL || env.DEVICE_TREE }} @ `${{ env.DEVICE_COMMIT }}`
+            * lunch: `${{ env.LUNCH_TARGET }}`
+            * targets: `${{ env.BUILD_TARGET }}`
+            * build type: `${{ env.FOX_BUILD_TYPE }}`
+            * workflow run: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+
+            `recovery.img` is ramdisk-only (the kernel comes from the stock `boot`
+            partition), so flash it with:
+
+            ```
+            fastboot flash recovery_a recovery.img
+            fastboot flash recovery_b recovery.img
+            ```
+
+            Verify the attached `recovery.img.sha256` before flashing.
+          files: |
+            self/artifacts/recovery.img
+            self/artifacts/recovery.img.sha256
+            self/artifacts/recovery.img.md5
+            self/dist/OrangeFox*.img
+            self/dist/OrangeFox*.zip
+            self/dist/OrangeFox*.md5
+            self/dist/ramdisk-recovery.img
+            self/dist/recovery-installer.zip
+          fail_on_unmatched_files: false
+          draft: false
+          prerelease: false
 
       - name: Publish build report to the ci-logs branch
         # Runs whatever happened and force-pushes a report (image info, the
